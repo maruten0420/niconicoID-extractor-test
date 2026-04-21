@@ -29,16 +29,14 @@ def format_duration(seconds):
         return "[不明]"
 
 def get_title_from_html(url):
-    """【新設】APIが弾かれた場合に、HTMLから強制的に<title>を抽出する"""
+    """APIが弾かれた場合に、HTMLから強制的に<title>を抽出する"""
     try:
-        # 人間のブラウザからのアクセスのように偽装して弾かれにくくする
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             match = re.search(r'<title>(.*?)</title>', response.text, re.IGNORECASE)
             if match:
                 title = html.unescape(match.group(1))
-                # 後ろにくっつくサイト名を削る
                 title = re.sub(r' - ニコニコ動画$', '', title)
                 title = re.sub(r' - YouTube$', '', title)
                 return title.strip()
@@ -57,9 +55,9 @@ def get_nico_metadata_api(video_id):
                 thumb = root.find('thumb')
                 raw_date = thumb.find('first_retrieve').text
                 dt = datetime.fromisoformat(raw_date)
-                
+
                 length_str = thumb.find('length').text if thumb.find('length') is not None else "[不明]"
-                
+
                 return {
                     'video_id': video_id,
                     'title': thumb.find('title').text,
@@ -72,13 +70,52 @@ def get_nico_metadata_api(video_id):
         pass
     return None
 
+def get_nico_metadata_snapshot(video_id):
+    """スナップショット検索API経由でメタデータを取得（デバイス規制動画に有効）"""
+    api_url = "https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search"
+    params = {
+        'q': video_id,
+        'targets': 'title',
+        'fields': 'contentId,title,userId,channelId,lengthSeconds,startTime',
+        '_limit': 1,
+        '_context': 'ranking_tool'
+    }
+    try:
+        response = requests.get(api_url, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get('data', [])
+            for item in items:
+                if item.get('contentId') == video_id:
+                    dt_str = item.get('startTime', '')
+                    try:
+                        dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+                        upload_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except:
+                        upload_date = "[不明]"
+
+                    length_sec = item.get('lengthSeconds')
+                    duration = format_duration(length_sec)
+
+                    return {
+                        'video_id': video_id,
+                        'title': item.get('title', '[タイトル取得不可]'),
+                        'uploader': str(item.get('userId') or item.get('channelId') or '不明'),
+                        'upload_date': upload_date,
+                        'duration': duration,
+                        'url': f"https://www.nicovideo.jp/watch/{video_id}"
+                    }
+    except Exception:
+        pass
+    return None
+
 def get_nico_mylist_metadata(mylist_url):
     """ニコニコ動画のマイリストRSSから動画一覧とマイリストコメントを取得する"""
     match = re.search(r'mylist/(\d+)', mylist_url)
     if not match:
         return None
     mylist_id = match.group(1)
-    
+
     url = f"https://www.nicovideo.jp/mylist/{mylist_id}?rss=2.0"
     videos = []
     try:
@@ -88,8 +125,9 @@ def get_nico_mylist_metadata(mylist_url):
             for item in root.findall('.//item'):
                 link = item.find('link').text
                 v_id = link.split('?')[0].split('/')[-1] if link else None
-                if not v_id: continue
-                
+                if not v_id:
+                    continue
+
                 desc_html = item.find('description').text or ""
                 memo_match = re.search(r'<p class="nico-memo">([\s\S]*?)</p>', desc_html)
                 if memo_match:
@@ -99,18 +137,24 @@ def get_nico_mylist_metadata(mylist_url):
                     memo = html.unescape(memo)
                 else:
                     memo = ""
-                
+
+                # ① getthumbinfo API
                 nico_data = get_nico_metadata_api(v_id)
+
+                # ② スナップショット検索API（デバイス規制動画に有効）
+                if not nico_data:
+                    nico_data = get_nico_metadata_snapshot(v_id)
+
                 if nico_data:
                     nico_data['mylist_comment'] = memo
                     videos.append(nico_data)
                 else:
-                    # RSS側にはデバイス規制動画もタイトルが含まれるため、それをそのまま使う
+                    # RSS側のタイトルをそのまま使う
                     title = item.find('title').text if item.find('title') is not None else "[タイトル取得不可]"
                     videos.append({
                         'video_id': v_id,
                         'title': title,
-                        'uploader': "[制限動画のため取得不可]",
+                        'uploader': "[デバイス規制動画]",
                         'upload_date': "[不明]",
                         'duration': "[不明]",
                         'mylist_comment': memo,
@@ -136,27 +180,27 @@ def extract_urls_from_text(text):
     """自由記入欄などのテキストから複数のURLやIDを安全に抽出する"""
     if pd.isna(text) or not str(text).strip() or str(text).lower() == 'nan':
         return []
-    
+
     text_str = str(text)
     urls = re.findall(r'https?://[^\s<>"]+', text_str)
     nicos = NICO_ID_RE.findall(text_str)
-    
+
     result = []
     for url in urls:
         if url not in result:
             result.append(url)
-            
+
     joined_urls = " ".join(result)
     for n_id in nicos:
         if n_id not in joined_urls:
             result.append(f"https://www.nicovideo.jp/watch/{n_id}")
-            
+
     return result
 
 def get_video_metadata(url):
     """情報取得のメイン制御"""
     url_str = str(url).strip()
-    
+
     if not url_str.startswith('http') and not NICO_ID_RE.search(url_str):
         return None
 
@@ -169,23 +213,31 @@ def get_video_metadata(url):
     nico_ids = NICO_ID_RE.findall(url_str)
     if nico_ids and "mylist" not in url_str:
         v_id = nico_ids[0]
+
+        # ① getthumbinfo API
         data = get_nico_metadata_api(v_id)
         if data:
             data['mylist_comment'] = ""
             return [data]
-        else:
-            # ★APIがデバイス規制等で弾かれた場合、HTMLからタイトルだけ引っこ抜く
-            fallback_title = get_title_from_html(url_str)
-            title_text = fallback_title if fallback_title else "[ニコニコ 制限動画のため取得不可]"
-            return [{
-                'video_id': v_id,
-                'title': title_text,
-                'uploader': "[制限動画]",
-                'upload_date': "[不明]",
-                'duration': "[不明]",
-                'mylist_comment': "",
-                'url': url_str
-            }]
+
+        # ② スナップショット検索API（デバイス規制動画に有効）
+        data = get_nico_metadata_snapshot(v_id)
+        if data:
+            data['mylist_comment'] = ""
+            return [data]
+
+        # ③ HTMLからタイトルだけ取る
+        fallback_title = get_title_from_html(url_str)
+        title_text = fallback_title if fallback_title else "[ニコニコ 制限動画のため取得不可]"
+        return [{
+            'video_id': v_id,
+            'title': title_text,
+            'uploader': "[デバイス規制動画]",
+            'upload_date': "[不明]",
+            'duration': "[不明]",
+            'mylist_comment': "",
+            'url': url_str
+        }]
 
     # YouTube等の場合
     ydl_opts = {
@@ -194,11 +246,11 @@ def get_video_metadata(url):
         'extract_flat': True,
         'skip_download': True,
     }
-    
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url_str, download=False)
-            
+
             if 'entries' in info:
                 videos = []
                 for entry in info['entries']:
@@ -206,11 +258,13 @@ def get_video_metadata(url):
                         v_id = entry.get('id')
                         if v_id and (v_id.startswith('sm') or v_id.startswith('so') or v_id.startswith('nm')):
                             nico_data = get_nico_metadata_api(v_id)
+                            if not nico_data:
+                                nico_data = get_nico_metadata_snapshot(v_id)
                             if nico_data:
                                 nico_data['mylist_comment'] = ""
                                 videos.append(nico_data)
                                 continue
-                        
+
                         videos.append({
                             'video_id': v_id or entry.get('url'),
                             'title': entry.get('title') or "[タイトル取得不可]",
@@ -234,7 +288,6 @@ def get_video_metadata(url):
     except Exception:
         v_id, platform = extract_id_manually(url_str)
         if v_id:
-            # ★yt-dlpが年齢制限等で弾かれた場合も、HTMLからタイトルだけ引っこ抜く
             fallback_title = get_title_from_html(url_str)
             title_text = fallback_title if fallback_title else f"[{platform} 制限等により取得不可]"
             return [{
@@ -261,9 +314,9 @@ def format_yt_date(date_str):
 
 def process_data(df):
     all_votes = []
-    video_meta_cache = {} 
-    respondent_counts = {} 
-    
+    video_meta_cache = {}
+    respondent_counts = {}
+
     progress_text = "動画解析中..."
     progress_bar = st.progress(0, text=progress_text)
     total_rows = len(df)
@@ -284,8 +337,9 @@ def process_data(df):
                 ext_text = str(row['マイリストに含める事ができない動画を選出する場合'])
             else:
                 ext_text = str(row.iloc[5]) if len(row) > 5 else ""
-                
-            if respondent == 'nan' or not respondent: respondent = f"匿名_{i+1}"
+
+            if respondent == 'nan' or not respondent:
+                respondent = f"匿名_{i+1}"
         except Exception:
             continue
 
@@ -295,16 +349,16 @@ def process_data(df):
         urls_to_process = []
         urls_to_process.extend(extract_urls_from_text(mylist_url))
         urls_to_process.extend(extract_urls_from_text(ext_text))
-        
+
         urls_to_process = list(dict.fromkeys(urls_to_process))
-        
+
         for url in urls_to_process:
             if url in video_meta_cache:
                 results = video_meta_cache[url]
             else:
                 results = get_video_metadata(url)
                 video_meta_cache[url] = results
-                time.sleep(0.05) 
+                time.sleep(0.05)
 
             if results:
                 for v in results:
@@ -321,7 +375,8 @@ def process_data(df):
 
         progress_bar.progress((i + 1) / total_rows, text=f"{progress_text} ({i+1}/{total_rows}行目)")
 
-    if not all_votes: return None, []
+    if not all_votes:
+        return None, []
 
     invalid_respondents = [name for name, count in respondent_counts.items() if count != 10]
     votes_df = pd.DataFrame(all_votes)
@@ -332,14 +387,14 @@ def process_data(df):
         'uploader': 'first',
         'duration': 'first',
         'respondent': lambda x: sorted(list(set(x))),
-        'comment': lambda x: " / ".join(filter(None, set(x))) 
+        'comment': lambda x: " / ".join(filter(None, set(x)))
     }).reset_index()
 
     ranking['得票数'] = ranking['respondent'].apply(len)
     ranking = ranking.sort_values(by=['得票数', 'video_id'], ascending=[False, True])
     ranking['順位(被りなし)'] = range(1, len(ranking) + 1)
     ranking['順位(被りあり)'] = ranking['得票数'].rank(ascending=False, method='min').astype(int)
-    
+
     return ranking, invalid_respondents
 
 # --- UI ---
@@ -360,22 +415,22 @@ if uploaded_file:
         try:
             with st.spinner("解析中..."):
                 result_df, invalid_respondents = process_data(df_input)
-            
+
             if result_df is not None and not result_df.empty:
                 if invalid_respondents:
                     st.warning(f"⚠️ 10作品ではない方: {', '.join(invalid_respondents)}")
 
                 final_output = result_df.copy()
                 final_output['選出者一覧'] = final_output['respondent'].apply(lambda x: ", ".join(x))
-                
+
                 final_output = final_output[[
                     '順位(被りあり)', '得票数', 'title', 'duration', 'video_id', 'upload_date', 'uploader', '選出者一覧', 'comment'
                 ]]
                 final_output = final_output.rename(columns={
-                    'title': '動画タイトル', 
+                    'title': '動画タイトル',
                     'duration': '再生時間',
-                    'video_id': '動画ID', 
-                    'upload_date': '投稿日時', 
+                    'video_id': '動画ID',
+                    'upload_date': '投稿日時',
                     'uploader': '投稿者',
                     'comment': 'マイリスコメント'
                 })
@@ -383,7 +438,7 @@ if uploaded_file:
                 st.success("集計完了！")
                 st.subheader("🏆 動画ランキング")
                 st.dataframe(final_output, use_container_width=True)
-                
+
                 csv_data = final_output.to_csv(index=False, encoding='utf-8-sig')
                 st.download_button(
                     label="📥 CSVをダウンロード",
